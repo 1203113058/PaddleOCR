@@ -1,0 +1,16 @@
+# 识别输出结果（不提交）
+output2/
+
+# OCR 临时图片
+*/_ppstruct_tmp/
+_ppstruct_tmp/
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# 配置（含本地路径，不提交）
+config.toml

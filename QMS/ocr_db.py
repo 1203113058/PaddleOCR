@@ -15,31 +15,45 @@ from ocr_config import load_config
 
 CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS `ocr_nonconformity_record` (
-  `id`              BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '主键',
-  `report_name`     VARCHAR(512)    NOT NULL DEFAULT '' COMMENT '报告文件名（不含路径）',
-  `report_type`     VARCHAR(64)     NOT NULL DEFAULT '' COMMENT '报告类型：力学检测等',
-  `input_full_path` VARCHAR(1024)   NOT NULL DEFAULT '' COMMENT '原始 PDF/图片完整路径',
-  `sheet_name`      VARCHAR(128)    NOT NULL DEFAULT '' COMMENT 'Excel 工作表名',
-  `page_no`         INT             NULL COMMENT '来源 PDF 页码',
-  `table_index`     INT             NULL COMMENT '该页内表格序号',
-  `sample_no`       VARCHAR(128)    NOT NULL DEFAULT '' COMMENT '试样编号',
-  `test_item`       VARCHAR(768)    NOT NULL DEFAULT '' COMMENT '检测项目（表头推断）',
-  `standard_text`   VARCHAR(512)    NOT NULL DEFAULT '' COMMENT '标准/要求值（单元格原文）',
-  `rule_type`       VARCHAR(16)     NOT NULL DEFAULT '' COMMENT '判定规则：range/gte/lte/eq',
-  `actual_value`    VARCHAR(512)    NOT NULL DEFAULT '' COMMENT '实测值',
-  `fail_reason`     VARCHAR(1024)   NOT NULL DEFAULT '' COMMENT '不合格原因',
-  `excel_row`       INT             NULL COMMENT 'Excel 行号',
-  `excel_col`       INT             NULL COMMENT 'Excel 列号',
-  `excel_col_letter` VARCHAR(8)     NOT NULL DEFAULT '' COMMENT 'Excel 列字母',
-  `xlsx_path`       VARCHAR(1024)   NOT NULL DEFAULT '' COMMENT '输出 Excel 路径',
-  `batch_id`        VARCHAR(64)     NOT NULL DEFAULT '' COMMENT '同次识别批次（时间戳）',
-  `created_at`      DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
-  `updated_at`      DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+  `id`               BIGINT UNSIGNED NOT NULL AUTO_INCREMENT                                    COMMENT '主键',
+  `report_name`      VARCHAR(512)    NOT NULL DEFAULT ''                                        COMMENT '报告文件名（不含路径）',
+  `report_type`      VARCHAR(64)     NOT NULL DEFAULT ''                                        COMMENT '报告类型：力学检测等',
+  `input_full_path`  VARCHAR(1024)   NOT NULL DEFAULT ''                                        COMMENT '原始 PDF/图片完整路径',
+  `sheet_name`       VARCHAR(128)    NOT NULL DEFAULT ''                                        COMMENT 'Excel 工作表名',
+  `page_no`          INT             NULL                                                       COMMENT '来源 PDF 页码',
+  `table_index`      INT             NULL                                                       COMMENT '该页内表格序号',
+  `sample_no`        VARCHAR(128)    NOT NULL DEFAULT ''                                        COMMENT '试样编号',
+  `test_item`        VARCHAR(768)    NOT NULL DEFAULT ''                                        COMMENT '检测项目（表头推断）',
+  `standard_text`    VARCHAR(512)    NOT NULL DEFAULT ''                                        COMMENT '标准/要求值（单元格原文）',
+  `rule_type`        VARCHAR(16)     NOT NULL DEFAULT ''                                        COMMENT '判定规则：range/gte/lte/eq',
+  `actual_value`     VARCHAR(512)    NOT NULL DEFAULT ''                                        COMMENT '实测值',
+  `fail_reason`      VARCHAR(1024)   NOT NULL DEFAULT ''                                        COMMENT '不合格原因',
+  `excel_row`        INT             NULL                                                       COMMENT 'Excel 行号',
+  `excel_col`        INT             NULL                                                       COMMENT 'Excel 列号',
+  `excel_col_letter` VARCHAR(8)      NOT NULL DEFAULT ''                                        COMMENT 'Excel 列字母',
+  `xlsx_path`        VARCHAR(1024)   NOT NULL DEFAULT ''                                        COMMENT '输出 Excel 路径',
+  `batch_id`         VARCHAR(64)     NOT NULL DEFAULT ''                                        COMMENT '同次识别批次（时间戳）',
+  `created_at`       DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP                         COMMENT 'Python 写入时间（兼容字段）',
+  `updated_at`       DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT 'Python 更新时间（兼容字段）',
+  -- 以下为框架标准字段（10个），与 Java BaseDO 保持一致
+  `deleted`          TINYINT(1)      NOT NULL DEFAULT 0                                         COMMENT '逻辑删除（0:未删除,1:已删除）',
+  `create_time`      DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP                         COMMENT '创建时间',
+  `update_time`      DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+  `creator`          VARCHAR(64)     NOT NULL DEFAULT ''                                        COMMENT '创建者',
+  `updater`          VARCHAR(64)     NOT NULL DEFAULT ''                                        COMMENT '更新者',
+  `dept_id`          BIGINT                   DEFAULT NULL                                      COMMENT '所属部门ID',
+  `owner_user_id`    BIGINT                   DEFAULT NULL                                      COMMENT '所属人ID',
+  `permission_scope` TINYINT         NOT NULL DEFAULT 0                                         COMMENT '权限范围（0:共用,1:部门,3:个人私用）',
+  `tenant_id`        BIGINT          NOT NULL DEFAULT 1                                         COMMENT '租户编号',
   PRIMARY KEY (`id`),
-  KEY `idx_report_batch` (`batch_id`),
-  KEY `idx_report_name` (`report_name`(191)),
-  KEY `idx_created` (`created_at`),
-  KEY `idx_sample` (`sample_no`(64))
+  KEY `idx_report_batch`   (`batch_id`),
+  KEY `idx_report_name`    (`report_name`(191)),
+  KEY `idx_created`        (`created_at`),
+  KEY `idx_sample`         (`sample_no`(64)),
+  KEY `idx_dept_id`        (`dept_id`),
+  KEY `idx_owner_user_id`  (`owner_user_id`),
+  KEY `idx_permission_scope` (`permission_scope`),
+  KEY `idx_tenant_deleted` (`tenant_id`, `deleted`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   COMMENT='OCR 表格识别-不合格项记录';
 """
@@ -98,7 +112,10 @@ def ensure_nonconformity_table() -> bool:
 
 def insert_nonconformity_records(rows: list[dict[str, Any]]) -> int:
     """
-    批量插入不合格记录。rows 每项为字段名字典（与表字段一致，不含 id/created_at/updated_at）。
+    批量插入不合格记录。rows 每项为字段名字典，只传业务字段。
+    以下字段由数据库默认值自动填充，无需传入：
+      id, created_at, updated_at, create_time, update_time,
+      deleted, creator, updater, dept_id, owner_user_id, permission_scope, tenant_id
     返回成功插入条数。
     """
     if not rows:

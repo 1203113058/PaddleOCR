@@ -20,8 +20,10 @@ PDF 表格识别 → Excel 输出（PP-Structure V3 版）
 import argparse
 import os
 import re
+import shutil
 import sys
 import time
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
@@ -36,11 +38,13 @@ from bs4 import BeautifulSoup
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
+from openpyxl.utils.cell import range_boundaries
 import numpy as np
 from paddleocr import PPStructureV3
 from PIL import Image, ImageDraw
 
 from ocr_config import load_config
+from ocr_db import build_record, ensure_nonconformity_table, insert_nonconformity_records
 
 MAX_IMAGE_WIDTH = 1600
 
@@ -168,37 +172,135 @@ def _parse_cell_bboxes(s: str) -> list[list[int]] | None:
         return None
 
 
-def extract_tables_from_page(engine: PPStructureV3, img_path: str) -> list[dict]:
+def _seq_for_ocr(x) -> list:
     """
-    对单页图片运行 PPStructureV3，返回识别到的所有表格信息列表。
-    每项：{
+    将 Paddle 返回的 rec_texts / rec_boxes 等转为 Python 列表。
+    禁止对 ndarray 做 `x or []`、`if x:` 等布尔判断，否则会触发 ambiguous truth value。
+    """
+    if x is None:
+        return []
+    if isinstance(x, np.ndarray):
+        return x.tolist()
+    if isinstance(x, (list, tuple)):
+        return list(x)
+    return [x]
+
+
+def _rec_box_to_xyxy(box) -> list[int] | None:
+    """将 rec_boxes / rec_polys 单项转为轴对齐 [x1,y1,x2,y2]。"""
+    if box is None:
+        return None
+    arr = np.asarray(box, dtype=float).reshape(-1)
+    if arr.size < 4:
+        return None
+    if arr.size == 4:
+        x1, y1, x2, y2 = (float(arr[i]) for i in range(4))
+    else:
+        pts = arr.reshape(-1, 2)
+        x1, x2 = float(pts[:, 0].min()), float(pts[:, 0].max())
+        y1, y2 = float(pts[:, 1].min()), float(pts[:, 1].max())
+    return [int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2))]
+
+
+def _extract_ocr_lines_from_pp_result(r: dict) -> list[dict]:
+    """
+    从单页 PPStructure 结果中提取通用 OCR 文本行及其在原图上的框。
+    返回 [{"text": str, "bbox": [x1,y1,x2,y2]}, ...]，与表格识别同源，用于紧贴数值画标注框。
+    """
+    ocr = r.get("overall_ocr_res")
+    if not isinstance(ocr, dict):
+        return []
+    texts = _seq_for_ocr(ocr.get("rec_texts"))
+    boxes = _seq_for_ocr(ocr.get("rec_boxes"))
+    polys = _seq_for_ocr(ocr.get("rec_polys"))
+    lines: list[dict] = []
+    for i, t in enumerate(texts):
+        if t is None:
+            continue
+        bb = None
+        if i < len(boxes):
+            bb = _rec_box_to_xyxy(boxes[i])
+        if bb is None and i < len(polys):
+            bb = _rec_box_to_xyxy(polys[i])
+        if bb is None:
+            continue
+        lines.append({"text": str(t), "bbox": bb})
+    if lines:
+        print(f"    → OCR 文本行：{len(lines)} 条（不合格标注优先贴合识别框）")
+    return lines
+
+
+def _filter_ocr_lines_to_table(
+    ocr_lines: list[dict],
+    table_bbox: list | None,
+    margin: int = 8,
+) -> list[dict]:
+    """
+    只保留几何中心落在 table_bbox（可扩边）内的 OCR 行，与「该表」识别坐标一致。
+    若过滤后为空（外框偏差大），退回全页 OCR，避免无匹配。
+    """
+    if not ocr_lines:
+        return []
+    tb = _seq_for_ocr(table_bbox) if table_bbox is not None else []
+    if len(tb) < 4:
+        return list(ocr_lines)
+    tx1, ty1, tx2, ty2 = (float(tb[i]) for i in range(4))
+    out: list[dict] = []
+    for L in ocr_lines:
+        bb = L.get("bbox")
+        if not bb or len(bb) < 4:
+            continue
+        cx = (bb[0] + bb[2]) / 2
+        cy = (bb[1] + bb[3]) / 2
+        if (tx1 - margin) <= cx <= (tx2 + margin) and (ty1 - margin) <= cy <= (ty2 + margin):
+            out.append(L)
+    return out if out else list(ocr_lines)
+
+
+def extract_tables_from_page(engine: PPStructureV3, img_path: str) -> tuple[list[dict], list[dict]]:
+    """
+    对单页图片运行 PPStructureV3，返回 (表格列表, OCR 文本行列表)。
+
+    表格项：{
       "html": str,
-      "table_bbox": [x1, y1, x2, y2] | None,   整个表格坐标
-      "cell_bboxes": [[x1,y1,x2,y2], ...] | None  每个 td 的精确坐标（按 HTML td 顺序）
+      "table_bbox": [x1, y1, x2, y2] | None,
+      "cell_bboxes": [[x1,y1,x2,y2], ...] | None,
+      "table_ocr_lines": 表区域内的 OCR 行列表（text+bbox，与 predict 底图同源）,
     }
-    优先使用 cell_bboxes 做精确图片标注，不可用时退回均匀网格估算。
+    OCR 行项：{"text": str, "bbox": [x1,y1,x2,y2]}
     """
     results = list(engine.predict(img_path))
     if not results:
-        return []
+        return [], []
 
     r = results[0]
+
+    # 与 predict 同一张底图上的全文 OCR（坐标系一致，后续按表裁剪、按格绑定）
+    ocr_lines = _extract_ocr_lines_from_pp_result(r)
 
     # 尝试从 table_res_list 提取每个表格的精确单元格坐标
     tbl_cell_bboxes: list[list[list[int]] | None] = []
     for tbl_res in r.get("table_res_list", []):
         tbl_str = str(tbl_res)
         cell_bboxes = _parse_cell_bboxes(tbl_str)
-        # 也尝试直接访问属性（不同版本可能支持）
+        # PPStructure V3 的 SingleTableRecognitionResult 是字典风格对象
+        # cell_box_list 通过 [] 访问（getattr 无效）
         if cell_bboxes is None:
-            for attr in ("cell_bbox", "cell_bboxes"):
-                val = getattr(tbl_res, attr, None)
-                if val is not None:
-                    try:
-                        cell_bboxes = [[int(v) for v in b[:4]] for b in val]
-                    except Exception:
-                        pass
-                    break
+            try:
+                raw_boxes = tbl_res["cell_box_list"]
+                if raw_boxes:
+                    bboxes = []
+                    for b in raw_boxes:
+                        arr = np.asarray(b, dtype=float).reshape(-1)
+                        if arr.size >= 4:
+                            bboxes.append([int(round(float(arr[0]))),
+                                           int(round(float(arr[1]))),
+                                           int(round(float(arr[2]))),
+                                           int(round(float(arr[3])))])
+                    if bboxes:
+                        cell_bboxes = bboxes
+            except Exception:
+                pass
         tbl_cell_bboxes.append(cell_bboxes)
 
     tables = []
@@ -226,22 +328,68 @@ def extract_tables_from_page(engine: PPStructureV3, img_path: str) -> list[dict]
 
             # 单元格精确坐标
             cell_bboxes = tbl_cell_bboxes[tbl_idx] if tbl_idx < len(tbl_cell_bboxes) else None
-
-            if cell_bboxes:
+            if isinstance(cell_bboxes, np.ndarray):
+                cell_bboxes = cell_bboxes.tolist()
+            if cell_bboxes is not None and len(cell_bboxes) > 0:
                 print(f"    → 表格 cell_bboxes：{len(cell_bboxes)} 个单元格坐标（精确模式）")
-            elif table_bbox:
+            elif table_bbox is not None and len(_seq_for_ocr(table_bbox)) >= 4:
                 print(f"    → 表格 bbox：{table_bbox}（均匀估算模式）")
             else:
                 print(f"    → 表格坐标：未提取到（图片标注将跳过）")
 
-            tables.append({"html": html, "table_bbox": table_bbox, "cell_bboxes": cell_bboxes})
+            scoped = _filter_ocr_lines_to_table(ocr_lines, table_bbox)
+            tables.append(
+                {
+                    "html": html,
+                    "table_bbox": table_bbox,
+                    "cell_bboxes": cell_bboxes,
+                    "table_ocr_lines": scoped,
+                }
+            )
             tbl_idx += 1
-    return tables
+    return tables, ocr_lines
 
 
 # ─── HTML 表格 → openpyxl Sheet ───────────────────────────────────────────────
 
 # ─── 判定规则引擎 ─────────────────────────────────────────────────────────────
+
+def _normalize_requirement_string(req: str) -> str:
+    """
+    统一 OCR 常见写法，避免「-50」类要求值解析失败导致整列不参与判定。
+    - 全角/长横负号 → ASCII '-'
+    - 行首「- 50」→「-50」
+    - 末尾温度单位（℃、°C）去掉后再走正则
+    """
+    s = req.strip()
+    for a, b in (
+        ("\u2212", "-"),
+        ("\u2013", "-"),
+        ("\u2014", "-"),
+        ("－", "-"),
+    ):
+        s = s.replace(a, b)
+    s = re.sub(r"^-\s+", "-", s)
+    s = re.sub(r"^\+\s+", "+", s)
+    s = re.sub(r"\s*(?:℃|°\s*C|°C)\s*$", "", s, flags=re.I)
+    return s.strip()
+
+
+def _normalize_actual_number_token(p: str) -> str:
+    """实测值片段：负号与单位规范化，保证 float 可解析、eq 可比。"""
+    s = p.strip()
+    for a, b in (
+        ("\u2212", "-"),
+        ("\u2013", "-"),
+        ("\u2014", "-"),
+        ("－", "-"),
+    ):
+        s = s.replace(a, b)
+    s = re.sub(r"^-\s+", "-", s)
+    s = re.sub(r"^\+\s+", "+", s)
+    s = re.sub(r"\s*(?:℃|°\s*C|°C)\s*$", "", s, flags=re.I)
+    return s.strip()
+
 
 def parse_requirement(req: str) -> dict | None:
     """
@@ -251,9 +399,9 @@ def parse_requirement(req: str) -> dict | None:
       区间      686-800   → {"type": "range", "min": 686, "max": 800}
       大于等于  ≥15       → {"type": "gte",   "value": 15}
       小于等于  ≤X        → {"type": "lte",   "value": X}
-      精确等于  -50       → {"type": "eq",    "value": -50}
+      精确等于  -50       → {"type": "eq",    "value": -50}（单独负数、无 ≥≤ 前缀）
     """
-    req = req.strip()
+    req = _normalize_requirement_string(req)
     if not req:
         return None
     # 区间：两个正数用 - 分隔（负数不会匹配，因为负数开头没有纯数字）
@@ -268,8 +416,8 @@ def parse_requirement(req: str) -> dict | None:
     m = re.match(r'^[≤<]=?\s*(-?\d+\.?\d*)$', req)
     if m:
         return {"type": "lte", "value": float(m.group(1))}
-    # 精确等于：纯数字或负数
-    m = re.match(r'^-?\d+\.?\d*$', req)
+    # 精确等于：纯数字或负数（冲击试验温度等「必须为 -50」走此分支，非 -50 判不合格）
+    m = re.match(r'^[-+]?\d+\.?\d*$', req)
     if m:
         return {"type": "eq", "value": float(req)}
     return None
@@ -290,7 +438,7 @@ def check_value(actual: str, rule: dict) -> bool | None:
     parts = re.split(r'[/\s]+', actual)
     values: list[float] = []
     for p in parts:
-        p = p.strip()
+        p = _normalize_actual_number_token(p)
         if not p:
             continue
         try:
@@ -316,14 +464,72 @@ def check_value(actual: str, rule: dict) -> bool | None:
     return all(_ok(v) for v in values)
 
 
-def apply_value_judgment(ws) -> list[tuple[int, int, str, str]]:
+def _rows_data_index(rows_data: list[tuple[int, list[str]]]) -> dict[int, list[str]]:
+    return {r: vals for r, vals in rows_data}
+
+
+def infer_test_item_for_column(
+    rows_by_row: dict[int, list[str]],
+    req_excel_row: int,
+    col_idx: int,
+) -> str:
+    """
+    根据「要求值」行向上追溯同列表头，拼出检测项目名称（如 屈服强度 Yield Strength）。
+    """
+    skip_exact = {
+        "要求值",
+        "Standard",
+        "standard",
+        "单位",
+        "Unit",
+        "Unit Symbol",
+        "实测值",
+        "Actual",
+        "试样编号",
+        "Sample No.",
+        "Sample No",
+    }
+    parts: list[str] = []
+    r = req_excel_row - 1
+    steps = 0
+    while r >= 1 and steps < 12:
+        vals = rows_by_row.get(r)
+        if vals is None or col_idx >= len(vals):
+            r -= 1
+            steps += 1
+            continue
+        cell = vals[col_idx].strip()
+        if not cell or cell in skip_exact:
+            r -= 1
+            steps += 1
+            continue
+        parts.append(cell)
+        if len(parts) >= 8:
+            break
+        r -= 1
+        steps += 1
+    if not parts:
+        r = req_excel_row - 1
+        while r >= 1:
+            vals = rows_by_row.get(r)
+            if vals and col_idx < len(vals):
+                c = vals[col_idx].strip()
+                if c and c not in skip_exact:
+                    return c[:768]
+            r -= 1
+        return f"列{get_column_letter(col_idx + 1)}"
+    return " ".join(reversed(parts))[:768]
+
+
+def apply_value_judgment(ws) -> list[dict]:
     """
     遍历已写入的 worksheet，自动找到「要求值」行和「试样」行，
     按列对比实测值与要求值，并对单元格着色：
       - 不合格：红色背景 #FFCCCC + 红色加粗字体
       - 无法解析：黄色背景 #FFF2CC（需人工复核）
 
-    返回：不合格单元格列表 [(excel_row, excel_col, actual_text, reason), ...]
+    返回：不合格记录列表，每项为 dict：
+      excel_row, excel_col, actual, reason, rule_type, standard_text, sample_no, test_item
     """
     FILL_FAIL    = PatternFill(fill_type="solid", fgColor="FFCCCC")
     FILL_UNKNOWN = PatternFill(fill_type="solid", fgColor="FFF2CC")
@@ -365,9 +571,11 @@ def apply_value_judgment(ws) -> list[tuple[int, int, str, str]]:
         print("  [判定] 要求值行中未解析到有效规则，跳过。")
         return []
 
+    rows_by_row = _rows_data_index(rows_data)
+
     # 定位试样行（第一个非空值符合 "数字-数字" 格式，如 22-9637）
     judged = 0
-    failures: list[tuple[int, int, str, str]] = []
+    failures: list[dict] = []
     for excel_row, row_vals in rows_data:
         if excel_row <= req_excel_row:
             continue
@@ -394,9 +602,30 @@ def apply_value_judgment(ws) -> list[tuple[int, int, str, str]]:
                     reason = f"{actual}<{rule['value']}"
                 elif t == "lte":
                     reason = f"{actual}>{rule['value']}"
+                elif t == "eq":
+                    exp = rule["value"]
+                    exp_s = str(int(exp)) if float(exp).is_integer() else str(exp)
+                    reason = f"{actual}≠{exp_s}"
                 else:
                     reason = f"{actual}≠{rule['value']}"
-                failures.append((excel_row, col_idx + 1, actual, reason))
+                standard_text = (
+                    req_vals[col_idx] if col_idx < len(req_vals) else ""
+                )
+                test_item = infer_test_item_for_column(
+                    rows_by_row, req_excel_row, col_idx
+                )
+                failures.append(
+                    {
+                        "excel_row": excel_row,
+                        "excel_col": col_idx + 1,
+                        "actual": actual,
+                        "reason": reason,
+                        "rule_type": t,
+                        "standard_text": standard_text,
+                        "sample_no": first_val,
+                        "test_item": test_item,
+                    }
+                )
                 judged += 1
             elif result is None:
                 cell.fill = FILL_UNKNOWN
@@ -457,13 +686,16 @@ def html_table_to_sheet(
 
             ws.cell(row=excel_row, column=excel_col, value=text)
 
-            # 记录该 td 对应的 Excel 坐标和 td 顺序索引
-            td_coord_map[(excel_row, excel_col)] = td_index
+            end_row = excel_row + rowspan - 1
+            end_col = excel_col + colspan - 1
+
+            # 合并区域内每个 (行,列) 都映射到同一 td_index，便于与 openpyxl 读格一致
+            for r in range(excel_row, end_row + 1):
+                for c in range(excel_col, end_col + 1):
+                    td_coord_map[(r, c)] = td_index
             td_index += 1
 
             if colspan > 1 or rowspan > 1:
-                end_row = excel_row + rowspan - 1
-                end_col = excel_col + colspan - 1
                 ws.merge_cells(
                     start_row=excel_row, start_column=excel_col,
                     end_row=end_row,     end_column=end_col,
@@ -505,6 +737,110 @@ def auto_column_width(ws):
 
 # ─── 图片标注 ──────────────────────────────────────────────────────────────────
 
+def _count_html_td_cells(html: str) -> int:
+    """统计 HTML 表格中 td/th 总数（与 html_table_to_sheet 遍历顺序一致）。"""
+    if not html:
+        return 0
+    soup  = BeautifulSoup(html, "html.parser")
+    table = soup.find("table")
+    if not table:
+        return 0
+    return sum(len(tr.find_all(["td", "th"])) for tr in table.find_all("tr"))
+
+
+def _align_cell_bbox_index(td_idx: int, cell_bboxes: list, n_td: int) -> int | None:
+    """
+    PPStructure 返回的 cell_bboxes 数量有时比 HTML 中 td 多 1（例如多一个表头/角格框），
+    会导致 td 索引与框一一对应时整体向左偏一格。此处按数量差自动平移索引。
+    """
+    n_b = len(cell_bboxes)
+    if n_td <= 0 or td_idx < 0:
+        return None
+    delta = n_b - n_td
+    adj   = td_idx
+    if delta == 1:
+        adj = td_idx + 1
+    elif delta == -1 and td_idx > 0:
+        adj = td_idx - 1
+    if 0 <= adj < n_b:
+        return adj
+    return None
+
+
+def _table_grid_metrics(tbl_info: dict) -> tuple[float, float, float, float, float, float, int, int] | None:
+    """table 外框 + HTML 逻辑行列数 → 均匀网格参数。返回 (tx1,ty1,tx2,ty2,cell_w,cell_h,n_rows,n_cols)。"""
+    table_bbox = tbl_info.get("table_bbox")
+    html       = tbl_info.get("html", "")
+    tb_list = _seq_for_ocr(table_bbox) if table_bbox is not None else []
+    if len(tb_list) < 4 or not html:
+        return None
+    soup  = BeautifulSoup(html, "html.parser")
+    table = soup.find("table")
+    if not table:
+        return None
+    rows   = table.find_all("tr")
+    n_rows = len(rows)
+    n_cols = max(
+        (sum(int(td.get("colspan", 1)) for td in tr.find_all(["td", "th"])) for tr in rows),
+        default=0,
+    )
+    if n_rows == 0 or n_cols == 0:
+        return None
+    tx1, ty1, tx2, ty2 = (float(tb_list[i]) for i in range(4))
+    cell_w = (tx2 - tx1) / n_cols
+    cell_h = (ty2 - ty1) / n_rows
+    return tx1, ty1, tx2, ty2, cell_w, cell_h, n_rows, n_cols
+
+
+def _grid_rect_pixels(
+    tbl_info: dict,
+    min_row: int,
+    max_row: int,
+    min_col: int,
+    max_col: int,
+) -> list[int] | None:
+    """Excel 1-based 闭区间 [min_row,max_row]×[min_col,max_col] → 底图像素矩形。"""
+    m = _table_grid_metrics(tbl_info)
+    if not m:
+        return None
+    tx1, ty1, _tx2, _ty2, cell_w, cell_h, n_rows, n_cols = m
+    r1 = max(0, min(min_row - 1, n_rows - 1))
+    r2 = max(0, min(max_row - 1, n_rows - 1))
+    c1 = max(0, min(min_col - 1, n_cols - 1))
+    c2 = max(0, min(max_col - 1, n_cols - 1))
+    if r2 < r1:
+        r1, r2 = r2, r1
+    if c2 < c1:
+        c1, c2 = c2, c1
+    x1 = int(tx1 + c1 * cell_w)
+    x2 = int(tx1 + (c2 + 1) * cell_w)
+    y1 = int(ty1 + r1 * cell_h)
+    y2 = int(ty1 + (r2 + 1) * cell_h)
+    return [x1, y1, x2, y2]
+
+
+def _coarse_bbox_from_ws_cell(ws, tbl_info: dict, excel_row: int, excel_col: int) -> list[int] | None:
+    """
+    结合工作表合并区域：若 (row,col) 在合并块内，粗框覆盖整块（像素与 HTML 表行对齐）。
+    """
+    min_r = max_r = excel_row
+    min_c = max_c = excel_col
+    for rng in ws.merged_cells.ranges:
+        c1, r1, c2, r2 = range_boundaries(str(rng))
+        if r1 <= excel_row <= r2 and c1 <= excel_col <= c2:
+            min_r, max_r, min_c, max_c = r1, r2, c1, c2
+            break
+    return _grid_rect_pixels(tbl_info, min_r, max_r, min_c, max_c)
+
+
+def _grid_cell_bbox_only(tbl_info: dict, excel_row: int, excel_col: int) -> list[int] | None:
+    """
+    仅用 table_bbox 与 HTML 表格行列数做均匀网格，得到单元格在底图上的矩形。
+    不读取 cell_bboxes，与 PPStructure 输出的 table 外框、识别坐标系一致，供绑定 OCR 行时作粗定位。
+    """
+    return _grid_rect_pixels(tbl_info, excel_row, excel_row, excel_col, excel_col)
+
+
 def _get_cell_img_bbox(
     tbl_info: dict,
     td_coord_map: dict,
@@ -518,42 +854,337 @@ def _get_cell_img_bbox(
     """
     cell_bboxes = tbl_info.get("cell_bboxes")
     td_idx      = td_coord_map.get((excel_row, excel_col))
+    html        = tbl_info.get("html", "")
 
-    # 精确模式：用 PPStructureV3 提供的单元格坐标
-    if cell_bboxes and td_idx is not None and td_idx < len(cell_bboxes):
-        return cell_bboxes[td_idx]
+    # 精确模式：用 PPStructureV3 提供的单元格坐标（cell_bboxes 可能是 ndarray，勿用 if cell_bboxes）
+    if (
+        cell_bboxes is not None
+        and len(cell_bboxes) > 0
+        and td_idx is not None
+    ):
+        n_td = _count_html_td_cells(html)
+        if n_td > 0:
+            adj = _align_cell_bbox_index(td_idx, cell_bboxes, n_td)
+        else:
+            adj = td_idx if 0 <= td_idx < len(cell_bboxes) else None
+        if adj is not None:
+            bb = cell_bboxes[adj]
+            arr = np.asarray(bb, dtype=float).reshape(-1)
+            if arr.size >= 4:
+                return [int(round(arr[i])) for i in range(4)]
 
-    # 退回模式：均匀网格估算
-    table_bbox = tbl_info.get("table_bbox")
-    html       = tbl_info.get("html", "")
-    if not table_bbox or not html:
-        return None
+    # 退回模式：均匀网格估算（与 _grid_cell_bbox_only 相同）
+    return _grid_cell_bbox_only(tbl_info, excel_row, excel_col)
 
-    soup  = BeautifulSoup(html, "html.parser")
-    table = soup.find("table")
-    if not table:
-        return None
 
-    rows   = table.find_all("tr")
-    n_rows = len(rows)
-    n_cols = max(
-        (sum(int(td.get("colspan", 1)) for td in tr.find_all(["td", "th"])) for tr in rows),
-        default=0,
-    )
-    if n_rows == 0 or n_cols == 0:
-        return None
+def _bbox_intersection_area(a: list[int], b: list[int]) -> int:
+    dx = min(a[2], b[2]) - max(a[0], b[0])
+    dy = min(a[3], b[3]) - max(a[1], b[1])
+    return max(0, dx) * max(0, dy)
 
-    tx1, ty1, tx2, ty2 = table_bbox
-    cell_w = (tx2 - tx1) / n_cols
-    cell_h = (ty2 - ty1) / n_rows
-    r_idx  = excel_row - 1
-    c_idx  = excel_col - 1
+
+def _expand_bbox(bb: list[int], px: int, img_w: int, img_h: int) -> list[int]:
     return [
-        int(tx1 + c_idx * cell_w),
-        int(ty1 + r_idx * cell_h),
-        int(tx1 + (c_idx + 1) * cell_w),
-        int(ty1 + (r_idx + 1) * cell_h),
+        max(0, bb[0] - px),
+        max(0, bb[1] - px),
+        min(img_w, bb[2] + px),
+        min(img_h, bb[3] + px),
     ]
+
+
+def _resolve_ocr_bbox_for_cell(
+    table_ocr_lines: list[dict],
+    cell_text: str,
+    coarse_bbox: list[int] | None,
+    img_w: int,
+    img_h: int,
+    expand_px: int = 28,
+) -> list[int] | None:
+    """
+    在「识别阶段」已截好的表内 OCR 行中，为单元格文本选一条最匹配的 bbox（与底图同源）。
+    coarse_bbox 为网格粗框，用于多处同文时的消歧。
+    """
+    if not table_ocr_lines:
+        return None
+    ct = clean_cell_text(str(cell_text).strip()) if cell_text else ""
+    if not ct:
+        return None
+    matches = _ocr_lines_for_actual(ct, table_ocr_lines)
+    if not matches:
+        return None
+    if len(matches) == 1:
+        return matches[0]["bbox"]
+    merged = _try_merge_split_matches(ct, matches)
+    if merged is not None:
+        return merged
+    if coarse_bbox is None:
+        return matches[0]["bbox"]
+    ex = _expand_bbox(coarse_bbox, expand_px, img_w, img_h)
+    ch = float(coarse_bbox[3] - coarse_bbox[1])
+
+    def score(L: dict) -> tuple:
+        bb = L["bbox"]
+        ia = _bbox_intersection_area(bb, ex)
+        cy, cx = (bb[1] + bb[3]) / 2, (bb[0] + bb[2]) / 2
+        ey = (ex[1] + ex[3]) / 2
+        ex_c = (ex[0] + ex[2]) / 2
+        bh = float(bb[3] - bb[1])
+        area = float((bb[2] - bb[0]) * (bb[3] - bb[1]))
+        tall_pen = (1e6 + bh) if (ch > 6 and bh > ch * 2.15) else 0.0
+        return (ia, -tall_pen, -area, -abs(cy - ey), -abs(cx - ex_c))
+
+    return max(matches, key=score)["bbox"]
+
+
+def build_cell_recognition_boxes(ws, tbl_info: dict, td_coord_map: dict, img_size: tuple[int, int]) -> None:
+    """
+    写入 Excel 后：按 td 合并块，用表内 OCR + 合并感知网格粗框为每个 (行,列) 绑定识别框。
+    结果写入 tbl_info["cell_recognition_boxes"]（作兜底，错误标注优先按 actual 现场匹配）。
+    """
+    img_w, img_h = img_size
+    table_ocr = tbl_info.get("table_ocr_lines")
+    if not table_ocr:
+        table_ocr = []
+    by_td: dict[int, list[tuple[int, int]]] = defaultdict(list)
+    for (r, c), ti in td_coord_map.items():
+        by_td[ti].append((r, c))
+    out: dict[tuple[int, int], list[int] | None] = {}
+    for _ti, positions in by_td.items():
+        r0, c0 = min(positions)
+        raw = ws.cell(row=r0, column=c0).value
+        text = clean_cell_text(str(raw)) if raw is not None else ""
+        coarse = _coarse_bbox_from_ws_cell(ws, tbl_info, r0, c0)
+        bb = _resolve_ocr_bbox_for_cell(table_ocr, text, coarse, img_w, img_h)
+        for pos in positions:
+            out[pos] = bb
+    tbl_info["cell_recognition_boxes"] = out
+
+
+def _ocr_text_matches_actual(actual: str, ocr_text: str) -> bool:
+    a = clean_cell_text(actual)
+    o = clean_cell_text(ocr_text)
+    if not a:
+        return False
+    if a == o:
+        return True
+    def squeeze(s: str) -> str:
+        s = s.replace("．", ".").replace("，", ",")
+        return re.sub(r"\s+", "", s)
+
+    return squeeze(a) == squeeze(o)
+
+
+def _ocr_lines_for_actual(actual: str, ocr_lines: list[dict]) -> list[dict]:
+    """先精确匹配，再无精确时用去空格后的子串匹配（适合 OCR 多字场景）。"""
+    if not actual or not ocr_lines:
+        return []
+    m = [L for L in ocr_lines if _ocr_text_matches_actual(actual, L["text"])]
+    if m:
+        return m
+    sa = clean_cell_text(str(actual).strip())
+    if len(sa) < 2:
+        return []
+
+    def sq(s: str) -> str:
+        return re.sub(r"\s+", "", s.replace("．", ".").replace("，", ","))
+
+    sqa = sq(sa)
+    out = []
+    for L in ocr_lines:
+        ot = sq(str(L.get("text", "")))
+        if not ot:
+            continue
+        if sqa in ot or ot in sqa:
+            out.append(L)
+    return out
+
+
+def _union_bboxes(bboxes: list[list[int]]) -> list[int]:
+    """合并多个 bbox 为最小外接矩形（union）。"""
+    return [
+        min(b[0] for b in bboxes),
+        min(b[1] for b in bboxes),
+        max(b[2] for b in bboxes),
+        max(b[3] for b in bboxes),
+    ]
+
+
+def _try_merge_split_matches(actual: str, matches: list[dict]) -> list[int] | None:
+    """
+    当多行 OCR 文本是同一单元格内容换行拆分时（如冲击吸收能量 "120/124/124"
+    被拆成 "120/124" 和 "/124" 两行），将所有行的 bbox 合并为一个大框。
+    判断条件：matches 按 y 坐标排序后文本拼合（去空格）== sq(actual)。
+    满足则返回合并 bbox，否则返回 None。
+    """
+    def sq(s: str) -> str:
+        return re.sub(r"\s+", "", s.replace("．", ".").replace("，", ","))
+
+    sqa = sq(clean_cell_text(str(actual).strip()))
+    if not sqa or len(matches) < 2:
+        return None
+    sorted_m = sorted(matches, key=lambda L: (L["bbox"][1], L["bbox"][0]))
+    combined = sq("".join(str(L.get("text", "")) for L in sorted_m))
+    if combined == sqa:
+        return _union_bboxes([L["bbox"] for L in sorted_m])
+    return None
+
+
+def _pick_ocr_bbox_for_failure(
+    actual: str,
+    cell_bbox: list[int] | None,
+    ocr_lines: list[dict] | None,
+    img_w: int | None = None,
+    img_h: int | None = None,
+    expand_px: int = 36,
+) -> list[int] | None:
+    """
+    用「不合格实测值 actual」在 OCR 行中选框，与识别底图同源。
+    多匹配时：扩边粗框内相交面积优先，其次惩罚过高 bbox（避免跨多行大块），再选面积较小、纵横向更近。
+    """
+    if not ocr_lines or not actual:
+        return None
+    matches = _ocr_lines_for_actual(actual, ocr_lines)
+    if not matches:
+        return None
+    if len(matches) == 1:
+        return matches[0]["bbox"]
+
+    # 多行拼合检测：OCR 按换行拆成多行但拼合文本 = actual → 合并 bbox（如冲击吸收能量）
+    merged = _try_merge_split_matches(actual, matches)
+    if merged is not None:
+        return merged
+
+    ex = None
+    coarse_h = 0.0
+    if cell_bbox is not None and img_w is not None and img_h is not None:
+        ex = _expand_bbox(cell_bbox, expand_px, img_w, img_h)
+        coarse_h = float(cell_bbox[3] - cell_bbox[1])
+    ccy = ccx = 0.0
+    if cell_bbox is not None:
+        ccy = (cell_bbox[1] + cell_bbox[3]) / 2
+        ccx = (cell_bbox[0] + cell_bbox[2]) / 2
+
+    sa = clean_cell_text(str(actual).strip())
+    sqa = re.sub(r"\s+", "", sa.replace("．", ".").replace("，", ","))
+    digitish = bool(sqa) and re.match(r"^[-+]?\d", sqa)
+
+    def sq_ocr(L: dict) -> str:
+        return re.sub(
+            r"\s+", "",
+            str(L.get("text", "")).replace("．", ".").replace("，", ","),
+        )
+
+    def sort_key(L: dict) -> tuple:
+        bb = L["bbox"]
+        if ex is not None:
+            ia = _bbox_intersection_area(bb, ex)
+        elif cell_bbox is not None:
+            ia = _bbox_intersection_area(bb, cell_bbox)
+        else:
+            ia = 0
+        cy = (bb[1] + bb[3]) / 2
+        cx = (bb[0] + bb[2]) / 2
+        bh = float(bb[3] - bb[1])
+        area = float((bb[2] - bb[0]) * (bb[3] - bb[1]))
+        tall_pen = 0.0
+        if coarse_h > 6 and bh > coarse_h * 2.15:
+            tall_pen = 1e6 + bh
+        len_diff = abs(len(sq_ocr(L)) - len(sqa)) if digitish else 0
+        return (ia, -tall_pen, -len_diff, -area, -abs(cy - ccy), -abs(cx - ccx))
+
+    return max(matches, key=sort_key)["bbox"]
+
+
+def export_ocr_mapping_excel(
+    page_no: int,
+    tbl_no: int,
+    ws,
+    tbl_info: dict,
+    failures: list[dict],
+    out_path: str,
+) -> None:
+    """
+    输出 OCR 坐标映射调试 Excel，帮助核查识别位置是否准确。
+
+    Sheet1「OCR文本行」  — 表格区域内所有 OCR 识别行，按 y→x 排序：
+        序号 / 识别文本 / x1 / y1 / x2 / y2 / 宽 / 高
+
+    Sheet2「单元格坐标」 — 每个非空单元格与其在图片上的匹配坐标：
+        Excel行 / Excel列 / 列字母 / 单元格文本 / OCR_x1 / OCR_y1 / OCR_x2 / OCR_y2 / 宽 / 高
+
+    Sheet3「不合格单元格」— 不合格项汇总：
+        Excel行 / Excel列 / 实测值 / 判定原因 / OCR_x1 / OCR_y1 / OCR_x2 / OCR_y2
+    """
+    from openpyxl.styles import PatternFill as _PF
+
+    wb_d = Workbook()
+    BOLD = Font(bold=True)
+    FILL_HDR = _PF(fill_type="solid", fgColor="D9E1F2")
+    FILL_FAIL = _PF(fill_type="solid", fgColor="FFCCCC")
+
+    def _set_header(sheet, headers: list[str]) -> None:
+        sheet.append(headers)
+        for cell in sheet[1]:
+            cell.font = BOLD
+            cell.fill = FILL_HDR
+
+    def _auto_width(sheet) -> None:
+        for col in sheet.columns:
+            w = max((len(str(c.value or "")) for c in col), default=6)
+            sheet.column_dimensions[col[0].column_letter].width = min(w + 4, 45)
+
+    # ── Sheet1：所有 OCR 文本行 ───────────────────────────────────────────────
+    ws_ocr = wb_d.active
+    ws_ocr.title = "OCR文本行"
+    _set_header(ws_ocr, ["序号", "识别文本", "x1(左)", "y1(上)", "x2(右)", "y2(下)", "宽px", "高px"])
+    ocr_lines = tbl_info.get("table_ocr_lines") or []
+    for i, line in enumerate(sorted(ocr_lines, key=lambda L: (L["bbox"][1], L["bbox"][0])), 1):
+        bb = line.get("bbox", [0, 0, 0, 0])
+        x1, y1, x2, y2 = bb
+        ws_ocr.append([i, line.get("text", ""), x1, y1, x2, y2, x2 - x1, y2 - y1])
+    _auto_width(ws_ocr)
+
+    # ── Sheet2：单元格坐标映射 ────────────────────────────────────────────────
+    ws_map = wb_d.create_sheet("单元格坐标")
+    _set_header(ws_map, ["Excel行", "Excel列", "列字母", "单元格文本",
+                          "OCR_x1", "OCR_y1", "OCR_x2", "OCR_y2", "宽px", "高px"])
+    rec_map = tbl_info.get("cell_recognition_boxes") or {}
+    visited: set[tuple[int, int]] = set()
+    for r in range(1, ws.max_row + 1):
+        for c in range(1, ws.max_column + 1):
+            raw = ws.cell(row=r, column=c).value
+            if raw is None or (r, c) in visited:
+                continue
+            visited.add((r, c))
+            text = str(raw).strip()
+            bb = rec_map.get((r, c))
+            if bb:
+                x1, y1, x2, y2 = bb
+                ws_map.append([r, c, get_column_letter(c), text, x1, y1, x2, y2, x2 - x1, y2 - y1])
+            else:
+                ws_map.append([r, c, get_column_letter(c), text, "", "", "", "", "", ""])
+    _auto_width(ws_map)
+
+    # ── Sheet3：不合格单元格 ──────────────────────────────────────────────────
+    ws_fail = wb_d.create_sheet("不合格单元格")
+    _set_header(ws_fail, ["Excel行", "Excel列", "列字母", "实测值", "判定原因",
+                           "OCR_x1", "OCR_y1", "OCR_x2", "OCR_y2"])
+    for f in failures:
+        r, c = f["excel_row"], f["excel_col"]
+        bb = rec_map.get((r, c))
+        row_data = [r, c, get_column_letter(c), f.get("actual", ""), f.get("reason", "")]
+        if bb:
+            row_data += list(bb)
+        else:
+            row_data += ["", "", "", ""]
+        ws_fail.append(row_data)
+        for cell in ws_fail[ws_fail.max_row]:
+            cell.fill = FILL_FAIL
+    _auto_width(ws_fail)
+
+    wb_d.save(out_path)
+    print(f"  [OCR映射] 已保存：{Path(out_path).name}"
+          f"（OCR行 {len(ocr_lines)} 条，单元格 {len(visited)} 个）")
 
 
 def mark_failures_on_image(
@@ -561,28 +1192,65 @@ def mark_failures_on_image(
     failures_with_meta: list,
     out_path: str,
     td_coord_maps: dict | None = None,
+    ocr_lines: list[dict] | None = None,
+    tbl_ws_map: dict | None = None,
 ) -> None:
     """
     在 PDF 渲染图片上以红色矩形框标注所有不合格单元格，并在框旁标注原因。
 
     failures_with_meta: [(tbl_info_dict, excel_row, excel_col, actual, reason), ...]
-    td_coord_maps: {tbl_info_id: td_coord_map}，由 html_table_to_sheet 返回，用于精确定位
+    td_coord_maps: {tbl_info_id: td_coord_map}
+    ocr_lines: 本页全文 OCR
+    tbl_ws_map: {tbl_info_id: worksheet}，用于合并单元格感知网格粗定位（与 Excel 一致）
+    策略：优先用「实测值 actual」在表内/全文 OCR 上匹配识别框 + 合并感知粗框消歧；
+          再兜底 cell_recognition_boxes、最后 _get_cell_img_bbox。
     out_path: 保存标注后图片的路径（jpg）
     """
     img   = Image.open(img_path).convert("RGB")
     draw  = ImageDraw.Draw(img)
     drawn = 0
+    W, H  = img.size
 
     for tbl_info, excel_row, excel_col, actual, reason in failures_with_meta:
         tbl_id       = id(tbl_info)
         td_coord_map = (td_coord_maps or {}).get(tbl_id, {})
-        cell_bbox    = _get_cell_img_bbox(tbl_info, td_coord_map, excel_row, excel_col)
+        ws           = (tbl_ws_map or {}).get(tbl_id)
+        if ws is not None:
+            coarse = _coarse_bbox_from_ws_cell(ws, tbl_info, excel_row, excel_col)
+        else:
+            coarse = _grid_cell_bbox_only(tbl_info, excel_row, excel_col)
 
-        if cell_bbox is None:
+        # ── 混合定位策略：OCR x 轴（列精度高）+ coarse y 轴（行准确，无 OCR 偏移）──
+        # OCR overall_ocr_res 存在系统性 y 轴偏低，但 x 轴列位置准确；
+        # 均匀网格 coarse 行高准确但列宽估算偏左；两者互补得到精确单元格位置。
+        scoped       = tbl_info.get("table_ocr_lines") or []
+        prefer_lines = scoped if scoped else (ocr_lines or [])
+
+        ocr_bbox  = _pick_ocr_bbox_for_failure(actual, coarse, prefer_lines, W, H)
+        if ocr_bbox is None:
+            ocr_bbox = _pick_ocr_bbox_for_failure(actual, coarse, ocr_lines, W, H)
+
+        if ocr_bbox is not None and coarse is not None:
+            # OCR x 中心（列定位）+ coarse 宽度（单元格宽）+ coarse y（行定位）
+            # 以 OCR 文字中心为水平中心，避免数字偏边导致框偏移
+            ocr_cx  = (ocr_bbox[0] + ocr_bbox[2]) / 2.0
+            cell_w  = coarse[2] - coarse[0]
+            x1 = max(0, int(round(ocr_cx - cell_w / 2)))
+            x2 = min(W, int(round(ocr_cx + cell_w / 2)))
+            draw_bbox = [x1, coarse[1], x2, coarse[3]]
+        elif ocr_bbox is not None:
+            draw_bbox = ocr_bbox
+        else:
+            # OCR 匹配失败：退回精确 cell_bboxes 或均匀网格
+            draw_bbox = _get_cell_img_bbox(tbl_info, td_coord_map, excel_row, excel_col)
+            if draw_bbox is None:
+                draw_bbox = coarse
+
+        if draw_bbox is None:
             print(f"  [跳过] 行{excel_row} 列{excel_col} 无法获取图片坐标，跳过标注。")
             continue
 
-        ix1, iy1, ix2, iy2 = cell_bbox
+        ix1, iy1, ix2, iy2 = draw_bbox
         draw.rectangle([ix1, iy1, ix2, iy2], outline=(220, 50, 50), width=3)
 
         label  = reason or actual
@@ -610,12 +1278,10 @@ def ocr_pdf_ppstruct(
     report_type:   报告类型，用于输出文件命名前缀（"力学检测"/"化学检测" 等）
     remove_stamp:  True 时自动去除图片/PDF 中的红色公章，减少 OCR 干扰
     输出文件命名规则：
-      图片_{report_type}_{编号}_{时间戳}.png       — PDF 渲染原图（已去章）
+      识别底图_{页}_{时间戳}.png                   — 与引擎共用底图（已去章，坐标同源）
       错误标注_{编号}_{时间戳}.jpg                 — 不合格标注图
       表格_{report_type}_{时间戳}.xlsx             — 识别结果表格
     """
-    from collections import defaultdict
-
     pdf_name    = Path(pdf_path).stem
     total_start = time.perf_counter()
     timestamp   = datetime.now().strftime("%Y%m%d%H%M%S")
@@ -645,6 +1311,20 @@ def ocr_pdf_ppstruct(
         print(f"  [错误] 不支持的文件格式：{suffix}，仅支持 PDF / JPG / JPEG / PNG")
         return
 
+    # 将临时渲染图复制到输出目录：后续 predict 与错误标注共用此路径，坐标与像素严格一致
+    archived_pages: list[tuple[int, str]] = []
+    for page_no, pth in pages:
+        dest = out_dir / f"识别底图_{page_no}_{timestamp}.png"
+        shutil.copy2(pth, dest)
+        archived_pages.append((page_no, str(dest)))
+    pages = archived_pages
+    print(f"  已保存识别底图至输出目录（共 {len(pages)} 张，与 OCR 坐标系一致）")
+
+    page_sizes: dict[int, tuple[int, int]] = {}
+    for page_no, pth in pages:
+        with Image.open(pth) as im:
+            page_sizes[page_no] = im.size
+
     # ── 2. PPStructureV3 识别 ─────────────────────────────────────────────────
     print("\n[2/4] 启动 PPStructureV3…")
     engine = PPStructureV3(lang="ch", device="cpu")
@@ -652,11 +1332,14 @@ def ocr_pdf_ppstruct(
     wb  = Workbook()
     # all_tables: [(页码, 表格序号, tbl_info_dict)]
     all_tables: list[tuple[int, int, dict]] = []
+    # 每页 OCR 文本行（与 predict 同源），用于错误标注时贴合原图识别位置
+    page_ocr_lines: dict[int, list[dict]] = {}
 
     for page_no, img_path in pages:
         t0 = time.perf_counter()
         print(f"\n  第 {page_no} 页  识别中…")
-        tables = extract_tables_from_page(engine, img_path)
+        tables, ocr_lines = extract_tables_from_page(engine, img_path)
+        page_ocr_lines[page_no] = ocr_lines
         elapsed = time.perf_counter() - t0
         print(f"  第 {page_no} 页  检测到 {len(tables)} 个表格  耗时 {elapsed:.1f}s")
 
@@ -679,6 +1362,12 @@ def ocr_pdf_ppstruct(
     page_failures_map: dict[int, list] = defaultdict(list)
     # td_coord_maps: tbl_info id → td_coord_map（用于精确图片标注）
     td_coord_maps: dict[int, dict] = {}
+    # 错误标注时按合并区域算网格，需 worksheet 引用
+    tbl_ws_map: dict[int, object] = {}
+    xlsx_path = out_dir / f"表格_{report_type}_{timestamp}.xlsx"
+    db_rows: list[dict] = []
+
+    ensure_nonconformity_table()
 
     for idx, (page_no, tbl_no, tbl_info) in enumerate(all_tables):
         sheet_name = f"P{page_no}_T{tbl_no}" if len(all_tables) > 1 else "Sheet1"
@@ -686,18 +1375,49 @@ def ocr_pdf_ppstruct(
         if idx == 0:
             ws.title = sheet_name
         last_row, td_coord_map = html_table_to_sheet(ws, tbl_info["html"], row_offset=1)
-        td_coord_maps[id(tbl_info)] = td_coord_map
+        tid = id(tbl_info)
+        td_coord_maps[tid] = td_coord_map
+        tbl_ws_map[tid] = ws
+        build_cell_recognition_boxes(
+            ws, tbl_info, td_coord_map, page_sizes[page_no]
+        )
         max_col  = ws.max_column
         apply_header_style(ws, last_row, max_col)
         failures = apply_value_judgment(ws)
         auto_column_width(ws)
         print(f"  Sheet [{sheet_name}]  {last_row-1} 行 × {max_col} 列")
 
-        for f_row, f_col, actual, reason in failures:
-            page_failures_map[page_no].append((tbl_info, f_row, f_col, actual, reason))
+        # 导出 OCR 坐标映射调试 Excel
+        ocr_map_path = out_dir / f"OCR坐标映射_P{page_no}_T{tbl_no}_{timestamp}.xlsx"
+        export_ocr_mapping_excel(page_no, tbl_no, ws, tbl_info, failures, str(ocr_map_path))
 
-    xlsx_path = out_dir / f"表格_{report_type}_{timestamp}.xlsx"
+        for f in failures:
+            page_failures_map[page_no].append(
+                (tbl_info, f["excel_row"], f["excel_col"], f["actual"], f["reason"])
+            )
+            db_rows.append(
+                build_record(
+                    pdf_path=pdf_path,
+                    report_type=report_type,
+                    xlsx_path=str(xlsx_path),
+                    batch_id=timestamp,
+                    sheet_name=sheet_name,
+                    page_no=page_no,
+                    table_index=tbl_no,
+                    excel_row=f["excel_row"],
+                    excel_col=f["excel_col"],
+                    sample_no=f["sample_no"],
+                    test_item=f["test_item"],
+                    standard_text=f["standard_text"],
+                    rule_type=f["rule_type"],
+                    actual_value=f["actual"],
+                    fail_reason=f["reason"],
+                    col_letter=get_column_letter(f["excel_col"]),
+                )
+            )
+
     wb.save(str(xlsx_path))
+    insert_nonconformity_records(db_rows)
 
     # ── 4. 生成不合格标注图片 ─────────────────────────────────────────────────
     print(f"\n[4/4] 生成不合格标注图片…")
@@ -708,11 +1428,17 @@ def ocr_pdf_ppstruct(
             print(f"  第 {page_no} 页  无不合格项，跳过图片标注。")
             continue
         marked_path = out_dir / f"错误标注_{page_no}_{timestamp}.jpg"
-        mark_failures_on_image(img_path, failures_this_page, str(marked_path), td_coord_maps)
+        mark_failures_on_image(
+            img_path,
+            failures_this_page,
+            str(marked_path),
+            td_coord_maps,
+            ocr_lines=page_ocr_lines.get(page_no),
+            tbl_ws_map=tbl_ws_map,
+        )
         marked_count += 1
 
-    # 清理临时图片目录
-    import shutil
+    # 清理临时图片目录（识别底图已复制到 out_dir）
     if tmp_dir.exists():
         shutil.rmtree(tmp_dir)
         print("  [清理] 临时图片已删除。")

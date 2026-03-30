@@ -17,6 +17,16 @@ DEFAULT_CONFIG: dict = {
         "threshold": 0.991,
         "row_tol": 15,
     },
+    # 不合格记录写入 MySQL（需 pip install pymysql）
+    "mysql": {
+        "enabled": True,
+        "host": "127.0.0.1",
+        "port": 3306,
+        "user": "root",
+        "password": "rootroot",
+        "database": "sg_local",
+        "table": "ocr_nonconformity_record",
+    },
 }
 
 
@@ -45,6 +55,9 @@ def load_config(config_path: Path | str | None = None) -> dict:
             cfg["output"].update(data["output"])
         if "ocr" in data:
             cfg["ocr"].update(data["ocr"])
+        if "mysql" in data:
+            cfg.setdefault("mysql", {})
+            cfg["mysql"].update(data["mysql"])
 
     except Exception as exc:
         print(f"  [警告] 读取 config.toml 失败，使用内置默认值：{exc}")
